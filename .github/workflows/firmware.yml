@@ -3,7 +3,7 @@ name: 固件构建
 on:
   push:
     branches: [ main ]
-    paths: [ 'firmware/**' ]          # 只有固件/定制变更才触发
+    paths: [ 'firmware/**' ]          # 只有变更才触发
   schedule:
     - cron: '0 18 1 * *'              # 每月 1 日（北京时间凌晨 2 点）
   workflow_dispatch: {}               # 手动触发
@@ -16,7 +16,7 @@ permissions:
   contents: write                     # 发布 Release 用
 
 env:
-  OPENWRT_COMMIT: fb742de8e5126809fddf16fa2b5e82b016be0edb   # 基座固定
+  OPENWRT_COMMIT: fb742de8e5126809fddf16fa2b5e82b016be0edb   # 基座钉死
 
 jobs:
   plan:
@@ -41,10 +41,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 移动
+      - name: 拷贝
         run: sudo mkdir -p /mnt/owrt && sudo chown "$USER" /mnt/owrt
 
-      - name: 编译依赖
+      - name: 装编译依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential clang flex bison g++ gawk \
@@ -108,7 +108,8 @@ jobs:
       - name: 收集产物
         run: |
           mkdir -p out
-          find /mnt/owrt/bin/targets $$ -name '*.img.gz' -o -name '*.manifest' $$ -exec cp {} out/ \;
+          find /mnt/owrt/bin/targets -name '*.img.gz' -exec cp -t out/ {} +
+          find /mnt/owrt/bin/targets -name '*.manifest' -exec cp -t out/ {} +
           (cd out && sha256sum * > sha256sums)
 
       - uses: actions/upload-artifact@v4
@@ -139,7 +140,7 @@ jobs:
             --prerelease --title "固件 $TAG" \
             --notes "CI 自动构建（beta）· 基座 ${OPENWRT_COMMIT}"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
-      - name: 检查确认（合格转正式版）
+      - name: 测试检查（合格转正式版）
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
           set -e
@@ -148,4 +149,4 @@ jobs:
             [ -s dist/fw-$d/sha256sums ] || { echo "缺校验和 $d，保持 beta"; exit 1; }
           done
           gh release edit "$TAG" --prerelease=false --latest
-          echo "检查通过，已转正式版"
+          echo "测试通过，已转正式版"
