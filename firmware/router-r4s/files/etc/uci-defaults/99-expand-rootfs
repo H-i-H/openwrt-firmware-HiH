@@ -1,0 +1,52 @@
+#!/bin/sh
+# 首启扩容：可用空间扩到磁盘 80%（loop 镜像链条：磁盘→分区→分区FS→loop文件→loop内f2fs）
+exec >/root/expand-rootfs.log 2>&1
+echo "== expand start: $(date)"
+for t in sfdisk partx; do command -v "$t" >/dev/null 2>&1 || { echo "缺 $t，放弃"; exit 0; }; done
+
+# 1. overlay 的 loop 设备与后备文件
+LOOPDEV=$(mount | awk '$2=="/overlay"{print $1; exit}')
+echo "loopdev=$LOOPDEV"
+case "$LOOPDEV" in /dev/loop*) ;; *) echo "非 loop 布局($LOOPDEV)，放弃"; exit 0;; esac
+BACKING=$(cat /sys/block/$(basename "$LOOPDEV")/loop/backing_file 2>/dev/null)
+[ -n "$BACKING" ] && [ -f "$BACKING" ] || { echo "找不到后备文件"; exit 0; }
+echo "backing=$BACKING"
+
+# 2. 后备文件所在的分区与文件系统
+FSPART=$(df "$BACKING" | awk 'NR==2{print $1}')
+FSTYPE=$(awk -v d="$FSPART" '$1==d{print $3; exit}' /proc/mounts)
+echo "fspath=$FSPART fstype=$FSTYPE"
+case "$FSPART" in /dev/mmcblk*p*|/dev/sd*|/dev/vd*) ;; *) echo "分区解析失败"; exit 0;; esac
+
+# 3. 几何计算（目标 80%）
+DISK=$(echo "$FSPART" | sed 's/p\?[0-9]*$//'); PART=$(echo "$FSPART" | grep -oE '[0-9]+$')
+B=$(basename "$DISK"); P=$(basename "$FSPART")
+TOTAL=$(cat /sys/block/$B/size); START=$(cat /sys/block/$B/$P/start); PSIZE=$(cat /sys/block/$B/$P/size)
+NEED=$((TOTAL * 80 / 100 - START))
+echo "disk=$DISK total=$TOTAL start=$START psize=$PSIZE need=$NEED"
+
+# 4. 扩分区 + 分区文件系统（只放大）
+if [ "$NEED" -gt "$PSIZE" ]; then
+  echo ",$NEED" | sfdisk -N "$PART" -q "$DISK" && partx -u "$DISK" 2>/dev/null
+  case "$FSTYPE" in
+    ext4|ext3|ext2) resize2fs "$FSPART" ;;
+    f2fs) resize.f2fs "$FSPART" ;;
+  esac
+else
+  echo "分区已达标，跳过"
+fi
+
+# 5. 扩 loop 镜像文件：吃掉新腾出空间的 90%
+FREE_KB=$(df "$BACKING" | awk 'NR==2{print $4}')
+CUR=$(ls -ln "$BACKING" | awk '{print $5}')
+ADD_KB=$((FREE_KB * 90 / 100))
+[ "$ADD_KB" -lt 102400 ] && { echo "可扩空间不足 100MB，跳过"; exit 0; }
+NEW=$((CUR + ADD_KB * 1024))
+echo "loop: $CUR -> $NEW bytes (+${ADD_KB}KB)"
+dd if=/dev/zero of="$BACKING" bs=1 count=0 seek="$NEW" 2>/dev/null
+losetup -c "$LOOPDEV" 2>/dev/null
+
+# 6. 扩 loop 内的 f2fs
+resize.f2fs "$LOOPDEV" 2>/dev/null || echo "resize.f2fs 未执行，可装包后手动重跑"
+echo "== expand done: $(date)"; df -h /
+exit 0
