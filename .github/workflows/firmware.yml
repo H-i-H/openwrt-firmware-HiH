@@ -80,7 +80,16 @@ jobs:
           # Go 保险：xray/sing-box 门槛（NOTES 1.1）
           grep -q 'GO_DEFAULT_VERSION:=1.27' feeds/packages/lang/golang/golang-values.mk || \
             sed -i 's/GO_DEFAULT_VERSION:=1.26/GO_DEFAULT_VERSION:=1.27/' feeds/packages/lang/golang/golang-values.mk
-          make defconfig
+          make defconfig || DEFCONFIG_RC=$?
+          echo === tool versions ===
+          make --version | head -1
+          python3 --version
+          echo === feed SHAs landed ===
+          for f in packages luci routing telephony video; do git -C feeds/$f log -1 --format=%H; done
+          echo === dump.txt ===
+          cat logs/feeds/HiH/luci-app-oaf/dump.txt 2>/dev/null | tail -12
+          cat logs/feeds/HiH/xray-core/dump.txt 2>/dev/null | tail -12
+          [ ${DEFCONFIG_RC:-0} = 0 ] || exit $DEFCONFIG_RC
           make download -j"$(nproc)" V=s
 
       - name: rustup 三件套（honk/eBPF，NOTES 9.1/9.9）
