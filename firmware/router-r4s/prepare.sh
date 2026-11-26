@@ -12,3 +12,9 @@ sed -i "s/3.openwrt.pool.ntp.org/cn.ntp.org.cn/" package/base-files/files/bin/co
 # 版本号带日期：$(shell ...) 才被 make 执行（原 $(...) 是坑）
 sed -i 's/VERSION_NICK:="[^"]*"/VERSION_NICK:="H-i-H build $(shell TZ=UTC-8 date +%Y.%m.%d)"/' include/version.mk
 sed -i 's/IMG_PREFIX:=$(VERSION_DIST_SANITIZED)/IMG_PREFIX:=$(shell date +%Y%m%d)-HiH-$(VERSION_DIST_SANITIZED)/' include/image.mk
+
+# 修复 7dollar：ucode 预编译找不到自定义模块，补 dynlink 留给运行时
+sed -i 's/dynlink=uloop/dynlink=uloop,dynlink=luci.7dollar/' feeds/luci/luci.mk
+grep -q 'dynlink=luci.7dollar' feeds/luci/luci.mk || {
+    echo "错误：luci.mk 补丁未生效" >&2; exit 1
+}
