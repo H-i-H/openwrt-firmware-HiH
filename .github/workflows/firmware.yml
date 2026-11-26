@@ -62,8 +62,10 @@ jobs:
 
       - name: 取基座源码
         run: |
-          git clone https://github.com/openwrt/openwrt.git /mnt/owrt
-          git -C /mnt/owrt checkout "$OPENWRT_COMMIT"
+          git init /mnt/owrt
+          git -C /mnt/owrt remote add origin https://github.com/openwrt/openwrt.git
+          for i in 1 2 3; do if git -C /mnt/owrt fetch --depth 1 origin $OPENWRT_COMMIT; then break; fi; sleep 15; done
+          git -C /mnt/owrt checkout FETCH_HEAD
 
       - name: 配 feed + 定制
         run: |
