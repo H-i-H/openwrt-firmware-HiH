@@ -137,6 +137,8 @@ jobs:
 
   release:
     needs: [plan, build]
+    env:
+      GH_REPO: ${{ github.repository }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
