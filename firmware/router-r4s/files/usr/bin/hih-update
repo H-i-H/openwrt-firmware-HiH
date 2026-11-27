@@ -1,0 +1,29 @@
+#!/bin/sh
+# HiH 固件更新：只从 H-i-H/openwrt-firmware-HiH 的正式版更新
+# 用法: hih-update          检查并确认后更新
+#       hih-update check    只检查不安装
+REPO="H-i-H/openwrt-firmware-HiH"
+DEV="@DEVICE@"
+CUR=$(. /etc/openwrt_release; echo "$DISTRIB_DESCRIPTION")
+echo "当前: $CUR"
+JSON=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest") || { echo 无法获取更新信息; exit 1; }
+TAG=$(echo "$JSON" | jsonfilter -e '@.tag_name')
+echo "最新正式版: $TAG"
+CURD=$(echo "$CUR" | grep -oE '20[0-9]{2}\.[0-9]{2}\.[0-9]{2}' | head -1)
+[ "$CURD" = "$TAG" ] && { echo 已是最新; exit 0; }
+IMG=$(echo "$JSON" | jsonfilter -e '@.assets[*].name' | grep "^HiH-$DEV-.*squashfs-sysupgrade.img.gz$")
+SUM=$(echo "$JSON" | jsonfilter -e '@.assets[*].name' | grep "^HiH-$DEV-.*sha256sums$")
+[ -n "$IMG" ] && [ -n "$SUM" ] || { echo 发布里没有本设备固件; exit 1; }
+echo "可更新到: $IMG"
+[ "$1" = check ] && exit 0
+echo -n "确认刷机? [y/N] "
+read -r A
+[ "$A" = y ] || { echo 已取消; exit 0; }
+cd /tmp
+curl -fsSL -o "$IMG" "https://github.com/$REPO/releases/download/$TAG/$IMG"
+curl -fsSL -o "$SUM" "https://github.com/$REPO/releases/download/$TAG/$SUM"
+EXPECT=$(grep -F " $IMG" "$SUM" | awk '{print $1}')
+ACTUAL=$(sha256sum "$IMG" | awk '{print $1}')
+[ -n "$EXPECT" ] && [ "$EXPECT" = "$ACTUAL" ] || { echo 校验失败，中止; exit 1; }
+echo 校验通过，开始刷机（保留配置），重启后生效
+sysupgrade "$IMG"

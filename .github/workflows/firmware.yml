@@ -3,32 +3,46 @@ name: 固件构建
 on:
   push:
     branches: [ main ]
-    paths: [ 'firmware/**' ]          # 只有变更才触发
+    paths: [ 'firmware/**' ]
   schedule:
-    - cron: '0 18 1 * *'              # 每月 1 日（北京时间凌晨 2 点）
-  workflow_dispatch: {}               # 手动触发
+    - cron: '0 18 1 * *'
+  workflow_dispatch:
+    inputs:
+      device:
+        description: '只编指定设备（留空=全部）'
+        required: false
+        default: ''
 
 concurrency:
   group: firmware-${{ github.ref }}
-  cancel-in-progress: true            # 新推送自动停止旧任务
+  cancel-in-progress: true
 
 permissions:
-  contents: write                     # 发布 Release 用
+  contents: write
 
 env:
-  OPENWRT_COMMIT: fb742de8e5126809fddf16fa2b5e82b016be0edb   # 基座钉死
+  OPENWRT_COMMIT: fb742de8e5126809fddf16fa2b5e82b016be0edb
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
       devices: ${{ steps.scan.outputs.devices }}
+      build_devices: ${{ steps.scan.outputs.build_devices }}
     steps:
       - uses: actions/checkout@v4
       - id: scan
         run: |
-          DEVS=$(ls firmware/*/config 2>/dev/null | sed 's|^firmware/||; s|/config$||' | jq -R -s -c 'split("\n")|map(select(length>0))')
-          echo "devices=$DEVS" >> "$GITHUB_OUTPUT"
+          ALL=$(ls firmware/*/config 2>/dev/null | sed 's|^firmware/||; s|/config$||' | jq -R -s -c 'split("\n")|map(select(length>0))')
+          SEL='${{ github.event.inputs.device }}'
+          if [ -n "$SEL" ]; then
+            BUILD=$(echo "$ALL" | jq -c --arg d "$SEL" 'map(select(.==$d))')
+            if [ "$BUILD" = "[]" ]; then echo "设备不存在: $SEL"; exit 1; fi
+          else
+            BUILD="$ALL"
+          fi
+          echo "devices=$ALL" >> "$GITHUB_OUTPUT"
+          echo "build_devices=$BUILD" >> "$GITHUB_OUTPUT"
 
   build:
     needs: plan
@@ -37,19 +51,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        device: ${{ fromJson(needs.plan.outputs.devices) }}
+        device: ${{ fromJson(needs.plan.outputs.build_devices) }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: 拷贝
+      - name: 大盘搬家
         run: sudo mkdir -p /mnt/owrt && sudo chown "$USER" /mnt/owrt
 
-      - name: 装编译依赖
+      - name: 编译依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang flex bison g++ gawk \
-            gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
-            python3-setuptools rsync swig unzip zlib1g-dev file wget curl zstd jq python3-pyelftools cmake libelf-dev
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev python3-setuptools rsync swig unzip zlib1g-dev file wget curl zstd jq python3-pyelftools cmake libelf-dev
 
       - name: 恢复下载缓存
         uses: actions/cache/restore@v4
@@ -60,14 +72,14 @@ jobs:
             fw-dl-${{ matrix.device }}-${{ env.OPENWRT_COMMIT }}-
             fw-dl-${{ matrix.device }}-
 
-      - name: 取基座源码
+      - name: 取 OpenWrt 源码
         run: |
           git init /mnt/owrt
           git -C /mnt/owrt remote add origin https://github.com/openwrt/openwrt.git
           for i in 1 2 3; do if git -C /mnt/owrt fetch --depth 1 origin $OPENWRT_COMMIT; then break; fi; sleep 15; done
           git -C /mnt/owrt checkout FETCH_HEAD
 
-      - name: 配 feed + 定制
+      - name: 配 feed + 定制 + 基因
         run: |
           cd /mnt/owrt
           cp "$GITHUB_WORKSPACE/firmware/feeds.conf.default" feeds.conf.default
@@ -75,38 +87,28 @@ jobs:
           ./scripts/feeds install -a
           bash "$GITHUB_WORKSPACE/firmware/${{ matrix.device }}/prepare.sh"
           cp "$GITHUB_WORKSPACE/firmware/${{ matrix.device }}/config" .config
-          [ -d "$GITHUB_WORKSPACE/firmware/${{ matrix.device }}/files" ] && \
-            cp -r "$GITHUB_WORKSPACE/firmware/${{ matrix.device }}/files/." files/ || true
-          # Go 保险：xray/sing-box 门槛（NOTES 1.1）
-          grep -q 'GO_DEFAULT_VERSION:=1.27' feeds/packages/lang/golang/golang-values.mk || \
-            sed -i 's/GO_DEFAULT_VERSION:=1.26/GO_DEFAULT_VERSION:=1.27/' feeds/packages/lang/golang/golang-values.mk
-          make defconfig || DEFCONFIG_RC=$?
-          echo === tool versions ===
-          make --version | head -1
-          python3 --version
-          echo === feed SHAs landed ===
-          for f in packages luci routing telephony video; do git -C feeds/$f log -1 --format=%H; done
-          echo === dump.txt ===
-          cat logs/feeds/HiH/luci-app-oaf/dump.txt 2>/dev/null | tail -12
-          cat logs/feeds/HiH/xray-core/dump.txt 2>/dev/null | tail -12
-          [ ${DEFCONFIG_RC:-0} = 0 ] || exit $DEFCONFIG_RC
+          if [ -d "$GITHUB_WORKSPACE/firmware/${{ matrix.device }}/files" ]; then
+            cp -r "$GITHUB_WORKSPACE/firmware/${{ matrix.device }}/files/." files/
+          fi
+          grep -q 'GO_DEFAULT_VERSION:=1.27' feeds/packages/lang/golang/golang-values.mk || sed -i 's/GO_DEFAULT_VERSION:=1.26/GO_DEFAULT_VERSION:=1.27/' feeds/packages/lang/golang/golang-values.mk
+          make defconfig
           make download -j"$(nproc)" V=s
 
-      - name: rustup 三件套（honk/eBPF，NOTES 9.1/9.9）
+      - name: rustup 三件套
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
           source "$HOME/.cargo/env"
           cd /mnt/owrt
           STABLE=$(grep -oP '^channel\s*=\s*"\K[^"]+' feeds/HiH/honk/src/rust-toolchain.toml 2>/dev/null || echo stable)
           NIGHTLY=$(grep -oP '^channel\s*=\s*"\K[^"]+' feeds/HiH/honk/src/crates/honk-ebpf/rust-toolchain.toml)
-          case "$(grep -E '^CONFIG_(aarch64|x86_64)=y' .config | head -1)" in
-            *x86_64*)  RUST_TARGET=x86_64-unknown-linux-musl ;;
-            *)         RUST_TARGET=aarch64-unknown-linux-musl ;;
-          esac
+          if grep -q '^CONFIG_x86_64=y' .config; then
+            RUST_TARGET=x86_64-unknown-linux-musl
+          else
+            RUST_TARGET=aarch64-unknown-linux-musl
+          fi
           rustup toolchain install "$STABLE" --profile minimal --target "$RUST_TARGET"
           rustup toolchain install "$NIGHTLY" --profile minimal --component rust-src --component llvm-tools
-          curl -fsSL --retry 3 -o /tmp/bpf.tar.zst \
-            "https://github.com/aya-rs/bpf-linker/releases/download/v0.13.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          curl -fsSL --retry 3 -o /tmp/bpf.tar.zst "https://github.com/aya-rs/bpf-linker/releases/download/v0.13.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
           zstd -dc /tmp/bpf.tar.zst | tar -xf - -C "$HOME/.cargo/bin"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
@@ -116,12 +118,14 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           make -j"$(nproc)" || make -j1 V=s
 
-      - name: 收集产物
+      - name: 收集产物（带设备短名）
         run: |
           mkdir -p out
           find /mnt/owrt/bin/targets -name '*.img.gz' -exec cp -t out/ {} +
           find /mnt/owrt/bin/targets -name '*.manifest' -exec cp -t out/ {} +
-          (cd out && sha256sum * > sha256sums)
+          cd out
+          for f in *; do mv "$f" "HiH-${{ matrix.device }}-$f"; done
+          ls HiH-${{ matrix.device }}-* | grep -v sha256sums | xargs sha256sum > HiH-${{ matrix.device }}-sha256sums
 
       - uses: actions/upload-artifact@v4
         with:
@@ -137,29 +141,46 @@ jobs:
 
   release:
     needs: [plan, build]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
     env:
       GH_REPO: ${{ github.repository }}
-    runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: fw-*
           path: dist
-      - name: 发布 beta
-        env: { GH_TOKEN: "${{ github.token }}" }
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: 发布（按设备追加，全部到齐转正式，留 3 个）
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="fw-$(TZ=UTC-8 date +%Y.%m.%d)"
-          gh release view "$TAG" >/dev/null 2>&1 && TAG="$TAG-$(TZ=UTC-8 date +%H%M%S)"
-          gh release create "$TAG" $(find dist -type f) \
-            --prerelease --title "固件 $TAG" \
-            --notes "CI 自动构建（beta）· 基座 ${OPENWRT_COMMIT}"
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
-      - name: 测试检查（合格转正式版）
-        env: { GH_TOKEN: "${{ github.token }}" }
-        run: |
-          set -e
-          for d in $(jq -r '.[]' <<< '${{ needs.plan.outputs.devices }}'); do
-            ls dist/fw-$d/*sysupgrade*.img.gz || { echo "缺镜像 $d，保持 beta"; exit 1; }
-            [ -s dist/fw-$d/sha256sums ] || { echo "缺校验和 $d，保持 beta"; exit 1; }
+          TAG="$(TZ=UTC-8 date +%Y.%m.%d)"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --prerelease --title "固件 $TAG" --notes "自动构建 · OpenWrt 源码版本 ${OPENWRT_COMMIT}"
+          fi
+          for d in $(jq -r '.[]' <<< '${{ needs.plan.outputs.build_devices }}'); do
+            if ls dist/HiH-$d-*sysupgrade*.img.gz >/dev/null 2>&1; then
+              gh release upload "$TAG" dist/HiH-$d-* --clobber
+            else
+              echo "缺镜像: $d，本轮跳过"
+            fi
           done
-          gh release edit "$TAG" --prerelease=false --latest
-          echo "测试通过，已转正式版"
+          gh api "repos/${GH_REPO}/releases/tags/$TAG" --jq '.assets[].name' > /tmp/assets.txt
+          MISSING=0
+          for d in $(jq -r '.[]' <<< '${{ needs.plan.outputs.devices }}'); do
+            if [ "$(grep -c "HiH-$d-.*sysupgrade" /tmp/assets.txt)" -gt 0 ]; then
+              echo "已到齐: $d"
+            else
+              echo "未到齐: $d"; MISSING=1
+            fi
+          done
+          if [ "$MISSING" = 0 ]; then
+            gh release edit "$TAG" --prerelease=false --latest
+            echo 全部到齐，已转正式版
+          else
+            echo 部分设备未出货，保持 beta
+          fi
+          gh api "repos/${GH_REPO}/releases" --jq '.[].tag_name' | tail -n +4 | while read -r t; do gh release delete "$t" -y --cleanup-tag || true; done

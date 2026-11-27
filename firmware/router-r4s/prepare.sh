@@ -18,3 +18,14 @@ sed -i 's/dynlink=uloop/dynlink=uloop,dynlink=luci.7dollar/' feeds/luci/luci.mk
 grep -q 'dynlink=luci.7dollar' feeds/luci/luci.mk || {
     echo "错误：luci.mk 补丁未生效" >&2; exit 1
 }
+
+# ttyd 与 libwebsockets 5.1 兼容：监听 7681 后立刻退出（上游 fddd638）
+D=$(dirname "$0")
+mkdir -p feeds/packages/utils/ttyd/patches
+cp "$D/patches/ttyd-libuv-loop.patch" feeds/packages/utils/ttyd/patches/
+test -s feeds/packages/utils/ttyd/patches/ttyd-libuv-loop.patch
+
+# 更新脚本写入本设备短名（匹配发布资产用）
+DEVNAME=$(basename "$(dirname "$0")")
+sed -i "s|@DEVICE@|$DEVNAME|" "$D/files/usr/bin/hih-update"
+grep -q "$DEVNAME" "$D/files/usr/bin/hih-update"
