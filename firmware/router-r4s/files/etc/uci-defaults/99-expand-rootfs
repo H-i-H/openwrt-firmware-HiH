@@ -16,7 +16,7 @@ echo "backing=$BACKING"
 FSPART=$(df "$BACKING" | awk 'NR==2{print $1}')
 FSTYPE=$(awk -v d="$FSPART" '$1==d{print $3; exit}' /proc/mounts)
 echo "fspath=$FSPART fstype=$FSTYPE"
-case "$FSPART" in /dev/mmcblk*p*|/dev/sd*|/dev/vd*) ;; *) echo "分区解析失败"; exit 0;; esac
+case "$FSPART" in /dev/mmcblk*p*|/dev/sd*|/dev/vd*|/dev/nvme*) ;; *) echo "分区解析失败"; exit 0;; esac
 
 # 3. 几何计算（目标 80%）
 DISK=$(echo "$FSPART" | sed 's/p\?[0-9]*$//'); PART=$(echo "$FSPART" | grep -oE '[0-9]+$')

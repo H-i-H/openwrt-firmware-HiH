@@ -12,13 +12,17 @@ on:
         description: '只编指定设备（留空=全部）'
         required: false
         default: ''
+      release_tag:
+        description: '补发到指定发布标签（如 2026.11.28；留空=今天）'
+        required: false
+        default: ''
 
 concurrency:
   group: firmware-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   OPENWRT_COMMIT: fb742de8e5126809fddf16fa2b5e82b016be0edb
@@ -28,42 +32,79 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       devices: ${{ steps.scan.outputs.devices }}
-      build_devices: ${{ steps.scan.outputs.build_devices }}
+      matrix: ${{ steps.scan.outputs.matrix }}
+      build_matrix: ${{ steps.scan.outputs.build_matrix }}
     steps:
       - uses: actions/checkout@v4
       - id: scan
+        env:
+          SEL: ${{ github.event.inputs.device }}
         run: |
-          ALL=$(ls firmware/*/config 2>/dev/null | sed 's|^firmware/||; s|/config$||' | jq -R -s -c 'split("\n")|map(select(length>0))')
-          SEL='${{ github.event.inputs.device }}'
-          if [ -n "$SEL" ]; then
-            BUILD=$(echo "$ALL" | jq -c --arg d "$SEL" 'map(select(.==$d))')
-            if [ "$BUILD" = "[]" ]; then echo "设备不存在: $SEL"; exit 1; fi
-          else
-            BUILD="$ALL"
-          fi
-          echo "devices=$ALL" >> "$GITHUB_OUTPUT"
-          echo "build_devices=$BUILD" >> "$GITHUB_OUTPUT"
+          ALL=$(ls firmware/*/config.head 2>/dev/null | sed 's|^firmware/||; s|/config.head$||')
+          for d in $ALL; do
+            if ! echo "$d" | grep -qE '^[a-z0-9-]+$'; then echo "设备名不合法: $d"; exit 1; fi
+          done
+          ALL_JSON=$(echo "$ALL" | jq -R -s -c 'split("\n")|map(select(length>0))')
+          MATRIX='[]'
+          BUILD='[]'
+          for d in $ALL; do
+            FP=$( { echo "$OPENWRT_COMMIT"; find firmware/feeds.conf.default firmware/common "firmware/$d" .github/workflows/firmware.yml -type f | sort | xargs sha256sum; } | sha256sum | cut -c1-12 )
+            echo "输入哈希 $d = $FP"
+            MATRIX=$(printf '%s' "$MATRIX" | jq -c --arg d "$d" --arg f "$FP" '. + [{device:$d, fp:$f}]')
+            if [ -z "$SEL" ] || [ "$d" = "$SEL" ]; then
+              BUILD=$(printf '%s' "$BUILD" | jq -c --arg d "$d" --arg f "$FP" '. + [{device:$d, fp:$f}]')
+            fi
+          done
+          if [ -n "$SEL" ] && [ "$BUILD" = "[]" ]; then echo "设备不存在: $SEL"; exit 1; fi
+          echo "devices=$ALL_JSON" >> "$GITHUB_OUTPUT"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "build_matrix=$BUILD" >> "$GITHUB_OUTPUT"
 
   build:
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
-        device: ${{ fromJson(needs.plan.outputs.build_devices) }}
+        device: ${{ fromJson(needs.plan.outputs.build_matrix) }}
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - name: 查产物库（相同输入已有产物则跳过编译）
+        env:
+          DEV: ${{ matrix.device }}
+          FP: ${{ matrix.fp }}
+        run: |
+          NAME="fw-$DEV-$FP"
+          N=$(gh api "repos/${GH_REPO}/actions/artifacts?name=$NAME" --jq '[.artifacts[] | select(.expired == false)] | length' || echo 0)
+          if [ "$N" -gt 0 ]; then
+            echo "SKIP_BUILD=true" >> "$GITHUB_ENV"
+            echo "产物库已有 $NAME，跳过编译"
+          else
+            echo "SKIP_BUILD=false" >> "$GITHUB_ENV"
+            echo "产物库无 $NAME，开始编译"
+          fi
 
-      - name: 大盘搬家
+      - uses: actions/checkout@v4
+        if: env.SKIP_BUILD == 'false'
+
+      - name: 迁移工作目录到 /mnt
+        if: env.SKIP_BUILD == 'false'
         run: sudo mkdir -p /mnt/owrt && sudo chown "$USER" /mnt/owrt
 
       - name: 编译依赖
+        if: env.SKIP_BUILD == 'false'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev python3-setuptools rsync swig unzip zlib1g-dev file wget curl zstd jq python3-pyelftools cmake libelf-dev
 
       - name: 恢复下载缓存
+        if: env.SKIP_BUILD == 'false'
         uses: actions/cache/restore@v4
         with:
           path: /mnt/owrt/dl
@@ -73,28 +114,54 @@ jobs:
             fw-dl-${{ matrix.device }}-
 
       - name: 取 OpenWrt 源码
+        if: env.SKIP_BUILD == 'false'
         run: |
           git init /mnt/owrt
           git -C /mnt/owrt remote add origin https://github.com/openwrt/openwrt.git
           for i in 1 2 3; do if git -C /mnt/owrt fetch --depth 1 origin $OPENWRT_COMMIT; then break; fi; sleep 15; done
           git -C /mnt/owrt checkout FETCH_HEAD
 
-      - name: 配 feed + 定制 + 基因
+      - name: 配置 feed 与设备定制
+        if: env.SKIP_BUILD == 'false'
+        env:
+          DEV: ${{ matrix.device }}
         run: |
           cd /mnt/owrt
           cp "$GITHUB_WORKSPACE/firmware/feeds.conf.default" feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-          bash "$GITHUB_WORKSPACE/firmware/${{ matrix.device }}/prepare.sh"
-          cp "$GITHUB_WORKSPACE/firmware/${{ matrix.device }}/config" .config
-          if [ -d "$GITHUB_WORKSPACE/firmware/${{ matrix.device }}/files" ]; then
-            cp -r "$GITHUB_WORKSPACE/firmware/${{ matrix.device }}/files/." files/
+          bash "$GITHUB_WORKSPACE/firmware/common/prepare.sh"
+          bash "$GITHUB_WORKSPACE/firmware/$DEV/prepare.sh"
+          mkdir -p files
+          cp -r "$GITHUB_WORKSPACE/firmware/common/files/." files/
+          if [ -d "$GITHUB_WORKSPACE/firmware/$DEV/files" ]; then
+            cp -r "$GITHUB_WORKSPACE/firmware/$DEV/files/." files/
           fi
-          grep -q 'GO_DEFAULT_VERSION:=1.27' feeds/packages/lang/golang/golang-values.mk || sed -i 's/GO_DEFAULT_VERSION:=1.26/GO_DEFAULT_VERSION:=1.27/' feeds/packages/lang/golang/golang-values.mk
+          if [ -f files/usr/bin/hih-update ]; then
+            PAT=$(cat "$GITHUB_WORKSPACE/firmware/$DEV/image-pattern")
+            sed -i "s|@DEVICE@|$DEV|" files/usr/bin/hih-update
+            sed -i "s|@IMG_PATTERN@|$PAT|" files/usr/bin/hih-update
+            grep -q "$DEV" files/usr/bin/hih-update
+            grep -qF "$PAT" files/usr/bin/hih-update
+          fi
+          cat "$GITHUB_WORKSPACE/firmware/$DEV/config.head" "$GITHUB_WORKSPACE/firmware/common/packages" "$GITHUB_WORKSPACE/firmware/$DEV/packages" > .config
           make defconfig
-          make download -j"$(nproc)" V=s
+          if [ -f "$GITHUB_WORKSPACE/firmware/$DEV/key-configs" ]; then
+            while read -r s; do
+              if [ -n "$s" ]; then
+                if ! grep -q "^$s=y" .config; then echo "关键配置丢失: $s"; exit 1; fi
+              fi
+            done < "$GITHUB_WORKSPACE/firmware/$DEV/key-configs"
+            echo 关键配置检查通过
+          fi
+          for i in 1 2 3; do
+            if make download -j"$(nproc)" V=s; then break; fi
+            if [ "$i" = 3 ]; then echo 下载三连失败; exit 1; fi
+            sleep 10
+          done
 
-      - name: rustup 三件套
+      - name: 安装 Rust 工具链（honk/eBPF 依赖）
+        if: env.SKIP_BUILD == 'false'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
           source "$HOME/.cargo/env"
@@ -113,27 +180,40 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: 编译
+        if: env.SKIP_BUILD == 'false'
         run: |
           cd /mnt/owrt
           export PATH="$HOME/.cargo/bin:$PATH"
           make -j"$(nproc)" || make -j1 V=s
 
-      - name: 收集产物（带设备短名）
+      - name: 收集产物（带设备短名与构建信息）
+        if: env.SKIP_BUILD == 'false'
+        env:
+          DEV: ${{ matrix.device }}
+          FP: ${{ matrix.fp }}
         run: |
           mkdir -p out
           find /mnt/owrt/bin/targets -name '*.img.gz' -exec cp -t out/ {} +
+          find /mnt/owrt/bin/targets -name '*.iso' -exec cp -t out/ {} +
+          find /mnt/owrt/bin/targets -name '*.vhd' -exec cp -t out/ {} +
+          find /mnt/owrt/bin/targets -name '*.vdi' -exec cp -t out/ {} +
+          find /mnt/owrt/bin/targets -name '*.vmdk' -exec cp -t out/ {} +
           find /mnt/owrt/bin/targets -name '*.manifest' -exec cp -t out/ {} +
           cd out
-          for f in *; do mv "$f" "HiH-${{ matrix.device }}-$f"; done
-          ls HiH-${{ matrix.device }}-* | grep -v sha256sums | xargs sha256sum > HiH-${{ matrix.device }}-sha256sums
+          n=$(ls | wc -l)
+          if [ "$n" = 0 ]; then echo "没有产出任何镜像"; exit 1; fi
+          for f in *; do mv "$f" "HiH-$DEV-$f"; done
+          printf 'device=%s fp=%s built=%s openwrt=%s\n' "$DEV" "$FP" "$(TZ=UTC-8 date +%F)" "$OPENWRT_COMMIT" > "HiH-$DEV-build-info"
+          ls | grep -v 'sha256sums$' | xargs sha256sum > "HiH-$DEV-sha256sums"
 
       - uses: actions/upload-artifact@v4
+        if: env.SKIP_BUILD == 'false'
         with:
-          name: fw-${{ matrix.device }}
+          name: fw-${{ matrix.device }}-${{ matrix.fp }}
           path: out/
 
       - name: 保存下载缓存（失败也存）
-        if: always()
+        if: always() && env.SKIP_BUILD == 'false'
         uses: actions/cache/save@v4
         with:
           path: /mnt/owrt/dl
@@ -141,46 +221,90 @@ jobs:
 
   release:
     needs: [plan, build]
-    if: always() && !cancelled()
+    if: always() && !cancelled() && needs.plan.result == 'success'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
     env:
       GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: fw-*
-          path: dist
-          merge-multiple: true
-        continue-on-error: true
-
-      - name: 发布（按设备追加，全部到齐转正式，留 3 个）
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: 收集各设备产物（含历史运行）
         run: |
-          TAG="$(TZ=UTC-8 date +%Y.%m.%d)"
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
+          mkdir -p dist
+          echo '${{ needs.plan.outputs.matrix }}' > /tmp/matrix.json
+          jq -r '.[] | .device + " " + .fp' /tmp/matrix.json > /tmp/pairs.txt
+          MISSING=0
+          while read -r DEV FP; do
+            RID=$(gh api "repos/${GH_REPO}/actions/artifacts?name=fw-$DEV-$FP" --jq '[.artifacts[] | select(.expired == false)][0].workflow_run.id' || echo "")
+            if [ -z "$RID" ] || [ "$RID" = "null" ]; then
+              echo "缺产物: $DEV (输入哈希 $FP)"
+              MISSING=1
+              continue
+            fi
+            mkdir -p "dist/$DEV"
+            gh run download "$RID" --repo "$GH_REPO" --name "fw-$DEV-$FP" --dir "dist/$DEV"
+            echo "已取到产物: $DEV 来自运行 $RID"
+          done < /tmp/pairs.txt
+          if [ "$MISSING" != 0 ]; then
+            echo "部分设备缺产物，本轮不发布。产物已留存，修复后重跑（其余设备自动跳过编译）即可一并发布。"
+            exit 0
+          fi
+          echo "ALL_READY=true" >> "$GITHUB_ENV"
+
+      - name: 汇总 manifest
+        if: env.ALL_READY == 'true'
+        run: |
+          find dist -name '*build-info' -exec cat {} + > dist/manifest.txt
+          cat dist/manifest.txt
+
+      - name: 内容比对（无变化则跳过发版）
+        if: env.ALL_READY == 'true'
+        run: |
+          NEW_FP=$(awk '{print $2}' dist/manifest.txt | sort | tr '\n' ' ')
+          LATEST=$(gh api "repos/${GH_REPO}/releases" --jq '[.[] | select(.prerelease == false)][0].tag_name' || echo "")
+          if [ -n "$LATEST" ] && [ "$LATEST" != "null" ]; then
+            mkdir -p /tmp/oldrel
+            gh release download "$LATEST" --repo "$GH_REPO" --pattern '*manifest*' --dir /tmp/oldrel || true
+            OLD_FP=$(cat /tmp/oldrel/*manifest* 2>/dev/null | awk '{print $2}' | sort | tr '\n' ' ')
+            if [ -n "$OLD_FP" ] && [ "$OLD_FP" = "$NEW_FP" ]; then
+              echo "输入哈希与已发布的 $LATEST 完全相同，跳过发版"
+              echo "SKIP_RELEASE=true" >> "$GITHUB_ENV"
+            fi
+          fi
+
+      - name: 发布（全部就绪后一次性转正式）
+        if: env.ALL_READY == 'true' && env.SKIP_RELEASE != 'true'
+        run: |
+          TAG_INPUT='${{ github.event.inputs.release_tag }}'
+          TAG="${TAG_INPUT:-$(TZ=UTC-8 date +%Y.%m.%d)}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "发布 $TAG 已存在，追加或替换资产"
+          else
             gh release create "$TAG" --prerelease --title "固件 $TAG" --notes "自动构建 · OpenWrt 源码版本 ${OPENWRT_COMMIT}"
           fi
-          for d in $(jq -r '.[]' <<< '${{ needs.plan.outputs.build_devices }}'); do
-            if ls dist/HiH-$d-*sysupgrade*.img.gz >/dev/null 2>&1; then
-              gh release upload "$TAG" dist/HiH-$d-* --clobber
-            else
-              echo "缺镜像: $d，本轮跳过"
-            fi
-          done
+          find dist -type f -print0 | xargs -0 -I{} gh release upload "$TAG" {} --clobber
           gh api "repos/${GH_REPO}/releases/tags/$TAG" --jq '.assets[].name' > /tmp/assets.txt
-          MISSING=0
-          for d in $(jq -r '.[]' <<< '${{ needs.plan.outputs.devices }}'); do
-            if [ "$(grep -c "HiH-$d-.*sysupgrade" /tmp/assets.txt)" -gt 0 ]; then
-              echo "已到齐: $d"
-            else
-              echo "未到齐: $d"; MISSING=1
+          cat /tmp/assets.txt
+          while read -r DEV FP; do
+            if ! grep -q "HiH-$DEV-" /tmp/assets.txt; then echo "发布资产缺失: $DEV"; exit 1; fi
+          done < /tmp/pairs.txt
+          gh release edit "$TAG" --prerelease=false --latest
+          echo "全部到齐，已转正式版"
+          gh api "repos/${GH_REPO}/releases" --jq '.[].tag_name' | tail -n +4 | while read -r t; do gh release delete "$t" -y --cleanup-tag || true; done
+          echo "已保留最新 3 个版本"
+
+      - name: 清理旧产物（保留当前输入哈希）
+        if: always()
+        run: |
+          if [ ! -f /tmp/matrix.json ]; then exit 0; fi
+          jq -r '.[] | "fw-" + .device + "-" + .fp' /tmp/matrix.json > /tmp/keep.txt
+          if [ ! -s /tmp/keep.txt ]; then exit 0; fi
+          gh api --paginate "repos/${GH_REPO}/actions/artifacts?per_page=100" --jq '.artifacts[] | [.id, .name] | @tsv' | while IFS="$(printf '\t')" read -r id name; do
+            if ! grep -qx "$name" /tmp/keep.txt; then
+              echo "清理: $name"
+              gh api -X DELETE "repos/${GH_REPO}/actions/artifacts/$id" || true
             fi
           done
-          if [ "$MISSING" = 0 ]; then
-            gh release edit "$TAG" --prerelease=false --latest
-            echo 全部到齐，已转正式版
-          else
-            echo 部分设备未出货，保持 beta
-          fi
-          gh api "repos/${GH_REPO}/releases" --jq '.[].tag_name' | tail -n +4 | while read -r t; do gh release delete "$t" -y --cleanup-tag || true; done
