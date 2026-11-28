@@ -13,3 +13,8 @@ grep -q 'GO_DEFAULT_VERSION:=1.2[78]' feeds/packages/lang/golang/golang-values.m
 mkdir -p feeds/packages/utils/ttyd/patches
 cp "$D/patches/ttyd-libuv-loop.patch" feeds/packages/utils/ttyd/patches/
 test -s feeds/packages/utils/ttyd/patches/ttyd-libuv-loop.patch
+
+# luci-theme-7dollar 兼容：ucode 预编译找不到自定义模块，声明运行时解析
+sed -i 's/dynlink=uloop/dynlink=uloop,dynlink=luci.7dollar/' feeds/luci/luci.mk
+grep -q 'dynlink=luci.7dollar' feeds/luci/luci.mk || {
+    echo "luci.mk 兼容修复未生效" >&2; exit 1; }
