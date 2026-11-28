@@ -70,7 +70,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        device: ${{ fromJson(needs.plan.outputs.build_matrix) }}
+        include: ${{ fromJson(needs.plan.outputs.build_matrix) }}
     env:
       GH_REPO: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
